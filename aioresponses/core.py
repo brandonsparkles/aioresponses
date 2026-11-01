@@ -182,6 +182,15 @@ class RequestMatch(object):
             headers=CIMultiDictProxy(self._prepare_request_headers(request_headers)),
             real_url=url
         )
+        response_parameters = inspect.signature(response_class).parameters
+        forwards_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in response_parameters.values()
+        )
+        if 'stream_writer' in response_parameters or (
+            forwards_kwargs and 'stream_writer' in inspect.signature(ClientResponse).parameters
+        ):
+            kwargs['stream_writer'] = Mock(output_size=0)
         kwargs['writer'] = None
         kwargs['continue100'] = None
         kwargs['timer'] = TimerNoop()
@@ -415,7 +424,7 @@ class aioresponses(object):
         key = (method, url)
 
         if not self.requests.get(key):
-            raise AssertionError(f'{self._format_call_signature(url, method=method, *args, **kwargs)} call not found')
+            raise AssertionError(f'{self._format_call_signature(url, *args, method=method, **kwargs)} call not found')
 
         actual = self.requests[key][-1]
         expected = self._build_request_call(method, *args, **kwargs)
@@ -445,7 +454,7 @@ class aioresponses(object):
             self.requests[key]
         except KeyError:
             expected_string = self._format_call_signature(
-                url, method=method, *args, **kwargs
+                url, *args, method=method, **kwargs
             )
             raise AssertionError(
                 '%s call not found' % expected_string

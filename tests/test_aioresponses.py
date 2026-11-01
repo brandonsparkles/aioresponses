@@ -6,7 +6,7 @@ from random import uniform
 from typing import Coroutine, Generator, Union
 from unittest.mock import patch
 
-from aiohttp import hdrs
+from aiohttp import hdrs, web
 from aiohttp import http
 from aiohttp.client import ClientSession
 from aiohttp.client_reqrep import ClientResponse
@@ -33,6 +33,20 @@ from .base import fail_on, skipIf, AsyncTestCase
 
 
 MINIMUM_AIOHTTP_VERSION = Version('3.4.0')
+
+async def local_api(test_case, status=200):
+    app = web.Application()
+
+    async def handler(_request):
+        return web.Response(status=status)
+
+    app.router.add_get('/{path:.*}', handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    test_case.addAsyncCleanup(runner.cleanup)
+    await web.TCPSite(runner, '127.0.0.1', 0).start()
+    return f'http://127.0.0.1:{runner.addresses[0][1]}'
+
 
 @ddt
 class AIOResponsesTestCase(AsyncTestCase):
@@ -90,6 +104,7 @@ class AIOResponsesTestCase(AsyncTestCase):
     @skipIf(condition=AIOHTTP_VERSION < Version('3.8.0'), reason='aiohttp must be >= 3.8.0')
     async def test_base_url(self, base_url, relative_url, m):
         m.get(self.url, status=200)
+        await self.session.close()
         self.session = ClientSession(base_url=base_url)
         response = await self.session.get(relative_url)
         self.assertEqual(response.status, 200)
@@ -98,6 +113,7 @@ class AIOResponsesTestCase(AsyncTestCase):
     @skipIf(condition=AIOHTTP_VERSION < Version('3.8.0'), reason='aiohttp must be >= 3.8.0')
     async def test_session_headers(self, m):
         m.get(self.url)
+        await self.session.close()
         self.session = ClientSession(headers={"Authorization": "Bearer foobar"})
         response = await self.session.get(self.url)
 
@@ -313,6 +329,14 @@ class AIOResponsesTestCase(AsyncTestCase):
         self.assertEqual(content, b'Test')
 
     @aioresponses()
+    async def test_streaming_large_body(self, m):
+        body = b'x' * (1024 * 1024)
+        m.get(self.url, body=body)
+        resp = await self.session.get(self.url)
+        content = await resp.content.read()
+        self.assertEqual(content, body)
+
+    @aioresponses()
     async def test_streaming_up_to(self, m):
         m.get(self.url, body='Test')
         resp = await self.session.get(self.url)
@@ -393,23 +417,27 @@ class AIOResponsesTestCase(AsyncTestCase):
         with aioresponses() as aiomock:
             url = 'http://example.com/Exception'
             aiomock.get(url, exception=Exception)
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(Exception, '^$') as raised:
                 await self.session.get(url)
+            self.assertIs(type(raised.exception), Exception)
 
             url = 'http://example.com/Exception_object'
             aiomock.get(url, exception=Exception())
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(Exception, '^$') as raised:
                 await self.session.get(url)
+            self.assertIs(type(raised.exception), Exception)
 
             url = 'http://example.com/BaseException'
             aiomock.get(url, exception=BaseException)
-            with self.assertRaises(BaseException):
+            with self.assertRaisesRegex(BaseException, '^$') as raised:
                 await self.session.get(url)
+            self.assertIs(type(raised.exception), BaseException)
 
             url = 'http://example.com/BaseException_object'
             aiomock.get(url, exception=BaseException())
-            with self.assertRaises(BaseException):
+            with self.assertRaisesRegex(BaseException, '^$') as raised:
                 await self.session.get(url)
+            self.assertIs(type(raised.exception), BaseException)
 
             url = 'http://example.com/CancelError'
             aiomock.get(url, exception=CancelledError)
@@ -524,7 +552,7 @@ class AIOResponsesTestCase(AsyncTestCase):
             assert str(exception_info.exception) == "Session is closed"
 
     async def test_address_as_instance_of_url_combined_with_pass_through(self):
-        external_api = 'http://httpbin.org/status/201'
+        external_api = f'{await local_api(self, status=201)}/status/201'
 
         async def doit():
             api_resp = await self.session.get(self.url)
@@ -541,7 +569,7 @@ class AIOResponsesTestCase(AsyncTestCase):
             self.assertEqual(ext.status, 201)
 
     async def test_pass_through_with_origin_params(self):
-        external_api = 'http://httpbin.org/get'
+        external_api = f'{await local_api(self)}/get'
 
         async def doit(params):
             # we have to hit actual url,
@@ -555,16 +583,24 @@ class AIOResponsesTestCase(AsyncTestCase):
             params = {'foo': 'bar'}
             ext = await doit(params=params)
             self.assertEqual(ext.status, 200)
-            self.assertEqual(str(ext.url), 'http://httpbin.org/get?foo=bar')
+            self.assertEqual(str(ext.url), f'{external_api}?foo=bar')
+            m.assert_not_called()
 
+    @data(False, True)
     @aioresponses()
-    async def test_custom_response_class(self, m):
+    async def test_custom_response_class(self, forwards_kwargs, m):
         class CustomClientResponse(ClientResponse):
             pass
 
-        m.get(self.url, body='Test', response_class=CustomClientResponse)
+        class ForwardingClientResponse(ClientResponse):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+        response_class = ForwardingClientResponse if forwards_kwargs else CustomClientResponse
+        m.get(self.url, body='Test', response_class=response_class)
         resp = await self.session.get(self.url)
-        self.assertTrue(isinstance(resp, CustomClientResponse))
+        self.assertIsInstance(resp, response_class)
+        self.assertEqual(await resp.text(), 'Test')
 
     @aioresponses()
     def test_exceptions_in_the_middle_of_responses(self, mocked):
@@ -913,7 +949,7 @@ class AIOResponseRedirectTest(AsyncTestCase):
 
     async def test_pass_through_unmatched_requests(self):
         matched_url = "https://matched_example.org"
-        unmatched_url = "https://httpbin.org/get"
+        unmatched_url = f'{await local_api(self)}/get'
         params_unmatched = {'foo': 'bar'}
 
         with aioresponses(passthrough_unmatched=True) as m:
@@ -923,5 +959,5 @@ class AIOResponseRedirectTest(AsyncTestCase):
                 URL(unmatched_url), params=params_unmatched
             )
             self.assertEqual(response.status, 200)
-            self.assertEqual(str(response.url), 'https://httpbin.org/get?foo=bar')
+            self.assertEqual(str(response.url), f'{unmatched_url}?foo=bar')
             self.assertEqual(mocked_response.status, 200)
